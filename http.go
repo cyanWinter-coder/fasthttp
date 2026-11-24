@@ -1771,6 +1771,10 @@ func (req *Request) ContinueReadBody(r *bufio.Reader, maxBodySize int, preParseM
 	if contentLength == -1 {
 		err = req.Header.ReadTrailer(r)
 		if err != nil {
+			// The body was read but its trailer is broken or missing, so
+			// the request is rejected as a whole: don't leave the partial
+			// body behind for the caller to act on.
+			req.Reset()
 			if err == io.EOF {
 				return ErrBrokenChunk{error: io.ErrUnexpectedEOF}
 			}
@@ -3511,6 +3515,14 @@ func readBodyIdentity(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, err
 	}
 }
 
+// maxBodyPreallocSize caps how much appendBodyFixedSize allocates up front
+// for a declared body or chunk size. The declared size is attacker-controlled
+// and is only validated against maxBodySize when a limit is set; without one,
+// trusting a huge Content-Length or chunk header would turn a few header
+// bytes into a giant allocation before a single body byte arrives. Bodies
+// larger than the cap are grown as data actually arrives.
+const maxBodyPreallocSize = 8 * 1024 * 1024
+
 func appendBodyFixedSize(r *bufio.Reader, dst []byte, n int) ([]byte, error) {
 	if n == 0 {
 		return dst, nil
@@ -3518,12 +3530,25 @@ func appendBodyFixedSize(r *bufio.Reader, dst []byte, n int) ([]byte, error) {
 
 	offset := len(dst)
 	dstLen := offset + n
+	if dstLen < offset {
+		// The declared size doesn't fit in an int on this platform.
+		return dst, ErrBodyTooLarge
+	}
 	if cap(dst) < dstLen {
-		b := make([]byte, roundUpForSliceCap(dstLen))
+		alloc := dstLen
+		if alloc > maxBodyPreallocSize {
+			alloc = maxBodyPreallocSize
+		}
+		if alloc <= offset {
+			// The buffer already holds more than the cap; keep doubling
+			// so the read below always has room to make progress.
+			alloc = 2 * offset
+		}
+		b := make([]byte, roundUpForSliceCap(alloc))
 		copy(b, dst)
 		dst = b
 	}
-	dst = dst[:dstLen]
+	dst = dst[:min(cap(dst), dstLen)]
 
 	for {
 		nn, err := r.Read(dst[offset:])
@@ -3540,6 +3565,13 @@ func appendBodyFixedSize(r *bufio.Reader, dst []byte, n int) ([]byte, error) {
 		offset += nn
 		if offset == dstLen {
 			return dst, nil
+		}
+		if offset == len(dst) {
+			// The declared size exceeded the pre-allocation cap and the
+			// peer really sent this much; grow towards dstLen.
+			b := make([]byte, roundUpForSliceCap(min(2*len(dst), dstLen)))
+			copy(b, dst)
+			dst = b[:min(cap(b), dstLen)]
 		}
 	}
 }
@@ -3561,6 +3593,13 @@ func readBodyChunked(r *bufio.Reader, maxBodySize int, dst []byte) ([]byte, erro
 	for {
 		chunkSize, err := parseChunkSize(r, &excess)
 		if err != nil {
+			// The peer closed before the last chunk, so the body is
+			// truncated. Report it like a truncated fixed-length body
+			// instead of a clean EOF, which callers - the server among
+			// them - take for a connection that ended between requests.
+			if err == io.EOF {
+				err = io.ErrUnexpectedEOF
+			}
 			return dst, err
 		}
 		if chunkSize == 0 {

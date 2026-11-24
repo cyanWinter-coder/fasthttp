@@ -39,12 +39,22 @@ type requestStream struct {
 	// The server loop owns the stream, so a handler resetting the request
 	// can't clear it.
 	failed bool
+	// err is the first non-EOF read error, returned by every Read after the
+	// one that produced it. The stream is at an unknown offset in the body
+	// then, so reading on could hand bytes of the next request to this one or
+	// block on a chunk header that never comes; the terminal state must stay
+	// the one the first error established.
+	err error
 }
 
 func (rs *requestStream) Read(p []byte) (int, error) {
+	if rs.err != nil {
+		return 0, rs.err
+	}
 	n, err := rs.read(p)
 	if err != nil && err != io.EOF {
 		rs.failed = true
+		rs.err = err
 	}
 	return n, err
 }
@@ -209,6 +219,7 @@ func releaseRequestStream(rs *requestStream) {
 	rs.chunkOverhead = 0
 	rs.reader = nil
 	rs.failed = false
+	rs.err = nil
 	rs.header = nil
 	rs.contentLength = 0
 	rs.eof = false
