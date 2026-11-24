@@ -1252,7 +1252,9 @@ func (req *Request) parsePostArgs() {
 	if !caseInsensitiveHasPrefix(req.Header.ContentType(), strPostArgsContentType) {
 		return
 	}
-	req.postArgs.ParseBytes(req.bodyBytes())
+	// Copy the form body into the Args' own storage so the pairs do not alias
+	// the request body buffer, which is returned to the body pool on Reset.
+	req.postArgs.parseBytesCopy(req.bodyBytes())
 }
 
 // ErrNoMultipartForm means that the request's Content-Type

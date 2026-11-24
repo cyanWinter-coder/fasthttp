@@ -250,15 +250,18 @@ func (u *URI) isHTTP() bool {
 
 // Reset clears uri.
 func (u *URI) Reset() {
-	u.pathOriginal = u.pathOriginal[:0]
-	u.scheme = u.scheme[:0]
-	u.path = u.path[:0]
-	u.queryString = u.queryString[:0]
-	u.hash = u.hash[:0]
-	u.username = u.username[:0]
-	u.password = u.password[:0]
+	// Small backing arrays are retained for allocation-free reuse on the next
+	// parse; oversized ones are dropped so a single large URI cannot pin peak
+	// memory on the pool.
+	u.pathOriginal = retainBytesSlice(u.pathOriginal)
+	u.scheme = retainBytesSlice(u.scheme)
+	u.path = retainBytesSlice(u.path)
+	u.queryString = retainBytesSlice(u.queryString)
+	u.hash = retainBytesSlice(u.hash)
+	u.username = retainBytesSlice(u.username)
+	u.password = retainBytesSlice(u.password)
 
-	u.host = u.host[:0]
+	u.host = retainBytesSlice(u.host)
 	u.queryArgs.Reset()
 	u.parsedQueryArgs = false
 	u.forceQuery = false
@@ -1118,7 +1121,10 @@ func (u *URI) parseQueryArgs() {
 	if u.parsedQueryArgs {
 		return
 	}
-	u.queryArgs.ParseBytes(u.queryString)
+	// Copy the query into the Args' own storage: the pairs must not alias
+	// u.queryString, whose backing array is reused and overwritten by the
+	// next request once this URI is pooled and reset.
+	u.queryArgs.parseBytesCopy(u.queryString)
 	u.parsedQueryArgs = true
 }
 

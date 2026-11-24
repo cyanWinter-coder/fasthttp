@@ -1496,22 +1496,28 @@ func (h *ResponseHeader) resetSkipNormalize() {
 	h.connectionClose = false
 
 	h.statusCode = 0
-	h.statusMessage = h.statusMessage[:0]
-	h.protocol = h.protocol[:0]
+	// Small backing arrays are resliced to zero and reused so the common
+	// steady state stays allocation-free; oversized ones are dropped so a
+	// one-off large response cannot pin peak memory on the pool.
+	h.statusMessage = retainBytesSlice(h.statusMessage)
+	h.protocol = retainBytesSlice(h.protocol)
 	h.contentLength = 0
-	h.contentLengthBytes = h.contentLengthBytes[:0]
+	h.contentLengthBytes = retainBytesSlice(h.contentLengthBytes)
 
-	h.contentType = h.contentType[:0]
-	h.contentEncoding = h.contentEncoding[:0]
-	h.server = h.server[:0]
+	h.contentType = retainBytesSlice(h.contentType)
+	h.contentEncoding = retainBytesSlice(h.contentEncoding)
+	h.server = retainBytesSlice(h.server)
 	h.serverSet = false
 	h.serverDefaultLine = nil
 
-	h.h = h.h[:0]
-	h.trailerH = h.trailerH[:0]
-	h.cookies = h.cookies[:0]
-	h.trailer = h.trailer[:0]
-	h.mulHeader = h.mulHeader[:0]
+	h.h = retainArgsKVSlices(h.h)
+	h.trailerH = retainArgsKVSlices(h.trailerH)
+	h.cookies = retainArgsKVSlices(h.cookies)
+	h.trailer = retainByteSlices(h.trailer)
+	// mulHeader, bufK and bufV are internal scratch rebuilt on every access.
+	h.mulHeader = retainByteSlices(h.mulHeader)
+	h.bufK = retainBytesSlice(h.bufK)
+	h.bufV = retainBytesSlice(h.bufV)
 	h.written = false
 }
 
@@ -1528,25 +1534,30 @@ func (h *RequestHeader) resetSkipNormalize() {
 	h.connectionClose = false
 
 	h.contentLength = 0
-	h.contentLengthBytes = h.contentLengthBytes[:0]
+	// Small arrays are retained (resliced to zero) for allocation-free reuse;
+	// arrays past the retention limit are dropped to bound peak pool memory.
+	h.contentLengthBytes = retainBytesSlice(h.contentLengthBytes)
 
-	h.method = h.method[:0]
-	h.protocol = h.protocol[:0]
-	h.requestURI = h.requestURI[:0]
-	h.host = h.host[:0]
-	h.contentType = h.contentType[:0]
-	h.userAgent = h.userAgent[:0]
+	h.method = retainBytesSlice(h.method)
+	h.protocol = retainBytesSlice(h.protocol)
+	h.requestURI = retainBytesSlice(h.requestURI)
+	h.host = retainBytesSlice(h.host)
+	h.contentType = retainBytesSlice(h.contentType)
+	h.userAgent = retainBytesSlice(h.userAgent)
 	h.userAgentSet = false
-	h.trailer = h.trailer[:0]
-	h.mulHeader = h.mulHeader[:0]
+	h.trailer = retainByteSlices(h.trailer)
+	// mulHeader, bufK and bufV are internal scratch rebuilt on access.
+	h.mulHeader = retainByteSlices(h.mulHeader)
 
-	h.h = h.h[:0]
-	h.trailerH = h.trailerH[:0]
-	h.cookies = h.cookies[:0]
+	h.h = retainArgsKVSlices(h.h)
+	h.trailerH = retainArgsKVSlices(h.trailerH)
+	h.cookies = retainArgsKVSlices(h.cookies)
 	h.cookiesCollected = false
 	h.written = false
 
-	h.rawHeaders = h.rawHeaders[:0]
+	h.rawHeaders = retainBytesSlice(h.rawHeaders)
+	h.bufK = retainBytesSlice(h.bufK)
+	h.bufV = retainBytesSlice(h.bufV)
 }
 
 func (h *header) copyTo(dst *header) {

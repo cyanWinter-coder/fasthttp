@@ -274,12 +274,16 @@ func (c *Cookie) SetKeyBytes(key []byte) {
 
 // Reset clears the cookie.
 func (c *Cookie) Reset() {
-	c.key = c.key[:0]
-	c.value = c.value[:0]
+	// Small arrays are retained for allocation-free reuse; oversized ones are
+	// dropped so a large cookie cannot pin peak memory on the pool.
+	c.key = retainBytesSlice(c.key)
+	c.value = retainBytesSlice(c.value)
 	c.expire = zeroTime
 	c.maxAge = 0
-	c.domain = c.domain[:0]
-	c.path = c.path[:0]
+	c.domain = retainBytesSlice(c.domain)
+	c.path = retainBytesSlice(c.path)
+	c.bufK = retainBytesSlice(c.bufK)
+	c.bufV = retainBytesSlice(c.bufV)
 	c.httpOnly = false
 	c.secure = false
 	c.sameSite = CookieSameSiteDisabled

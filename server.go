@@ -12,6 +12,7 @@ import (
 	"mime/multipart"
 	"net"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -2501,7 +2502,7 @@ func (s *Server) serveConn(c net.Conn) error {
 	return s.serveConnCounted(c, true)
 }
 
-func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
+func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) (err error) {
 	defer s.serveConnCleanup(countConcurrency)
 	if countConcurrency {
 		s.concurrency.Add(1)
@@ -2581,6 +2582,33 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		continueReadingRequest = true
 	)
+
+	// One cleanup entry for every way the request loop ends: normal return,
+	// parse or write failure, and a panic in the handler. A panic must not
+	// bypass pooling, or the ctx and its buffers keep the half-parsed request
+	// and the worker goroutine dies with the connection still open.
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger().Printf("panic when serving connection %q<->%q: %v\n%s",
+				c.LocalAddr(), c.RemoteAddr(), r, debug.Stack())
+			err = fmt.Errorf("fasthttp: panic serving connection: %v", r)
+		}
+		if br != nil {
+			releaseReader(s, br)
+		}
+		if bw != nil {
+			releaseWriter(s, bw)
+		}
+		if ctx != nil && hijackHandler == nil {
+			s.releaseCtx(ctx)
+		}
+		// Release the stream of the last request if the loop ended before
+		// doing so. This goes after the ctx reset above, which hands the
+		// body buffer the stream still reads from over to it.
+		if reqStream != nil {
+			releaseRequestStream(reqStream)
+		}
+	}()
 	for {
 		connRequestNum++
 
@@ -3156,21 +3184,8 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		}
 	}
 
-	if br != nil {
-		releaseReader(s, br)
-	}
-	if bw != nil {
-		releaseWriter(s, bw)
-	}
-	if ctx != nil && hijackHandler == nil {
-		s.releaseCtx(ctx)
-	}
-	// Release the stream of the last request if the loop ended before doing
-	// so. This goes after the ctx reset above, which hands the body buffer
-	// the stream still reads from over to it.
-	if reqStream != nil {
-		releaseRequestStream(reqStream)
-	}
+	// Readers, writers, ctx and reqStream are released by the deferred
+	// cleanup above, which also runs when the loop exits via a panic.
 
 	s.idleConnsMu.Lock()
 	ic, ok := s.idleConns[c]

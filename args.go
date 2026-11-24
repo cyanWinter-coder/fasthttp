@@ -7,6 +7,7 @@ import (
 	"iter"
 	"sort"
 	"sync"
+	"unsafe"
 )
 
 const (
@@ -36,6 +37,56 @@ var argsPool = &sync.Pool{
 	},
 }
 
+// maxRetainedArgBufferSize bounds the backing memory a pooled object keeps
+// after Reset. A request with an unusually long query, form body or header
+// would otherwise pin its peak allocation for the whole pool's lifetime.
+const maxRetainedArgBufferSize = 512 * 1024
+
+// maxRetainedArgEntries bounds the number of pooled key/value entries a
+// single object keeps so a request with many small pairs cannot retain a
+// large entries array either.
+const maxRetainedArgEntries = maxRetainedArgBufferSize / int(unsafe.Sizeof(argsKV{}))
+
+// retainBytesSlice returns s resliced to zero while its backing array is
+// small enough to keep for reuse, or nil once it grew past the retention
+// limit so a one-off oversized request cannot pin peak memory on the pool.
+//
+// The returned zero-length slice must never be appended into where a caller
+// could still observe the old bytes: pooled parsers own their storage, and
+// the retention limit guarantees a reused array stays small.
+func retainBytesSlice(s []byte) []byte {
+	if cap(s) > maxRetainedArgBufferSize {
+		return nil
+	}
+	return s[:0]
+}
+
+// retainArgsKVSlices is retainBytesSlice for the key/value entry arrays used
+// by headers, cookies and args. The entry count is checked against the
+// entries limit, and each nested key/value byte slice against the byte
+// limit, so a single oversized header or cookie value is dropped too.
+func retainArgsKVSlices(s []argsKV) []argsKV {
+	if cap(s) > maxRetainedArgEntries {
+		return nil
+	}
+	for i := range s {
+		if cap(s[i].key) > maxRetainedArgBufferSize ||
+			cap(s[i].value) > maxRetainedArgBufferSize {
+			return nil
+		}
+	}
+	return s[:0]
+}
+
+// retainByteSlices handles slices of byte slices, such as multi-value
+// headers and trailer name lists.
+func retainByteSlices(s [][]byte) [][]byte {
+	if cap(s) > maxRetainedArgEntries {
+		return nil
+	}
+	return s[:0]
+}
+
 // Args represents query arguments.
 //
 // It is forbidden copying Args instances. Create new instances instead
@@ -56,8 +107,22 @@ type argsKV struct {
 }
 
 // Reset clears query args.
+//
+// Small backing arrays are kept resliced to zero so parsing repeated,
+// similarly-sized requests stays allocation-free. Arrays that grew past the
+// retention limit are dropped instead, so a single oversized request cannot
+// pin its peak allocation on the pool.
 func (a *Args) Reset() {
-	a.args = a.args[:0]
+	a.args = retainArgsKVSlices(a.args)
+	a.buf = retainBytesSlice(a.buf)
+}
+
+// parseBytesCopy parses b while owning the storage: b is copied into the
+// internal scratch buffer first, so the resulting key/value pairs never
+// alias a caller-owned buffer that may be pooled while the Args stay alive.
+func (a *Args) parseBytesCopy(b []byte) {
+	a.buf = append(a.buf[:0], b...)
+	a.ParseBytes(a.buf)
 }
 
 // CopyTo copies all args to dst.
