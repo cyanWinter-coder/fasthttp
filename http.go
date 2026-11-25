@@ -72,6 +72,10 @@ type Request struct {
 	// if <= 0, means not set
 	timeout time.Duration
 
+	// deadline is an optional absolute upper bound shared by redirect hops
+	// and their retries. It is scoped to one synchronous Do call.
+	deadline time.Time
+
 	secureErrorLogMessage bool
 
 	// Group bool members in order to reduce Request object size.
@@ -1562,6 +1566,7 @@ func (req *Request) Reset() {
 	req.Header.Reset()
 	req.resetSkipHeader()
 	req.timeout = 0
+	req.deadline = time.Time{}
 	req.logger = nil
 	req.forceResponseBodyBuffering = false
 	req.UseHostHeader = false
@@ -3676,6 +3681,10 @@ func readCrLf(r *bufio.Reader) error {
 }
 
 // SetTimeout sets timeout for the request.
+//
+// If the request is sent through a redirect-following method, this is the
+// total budget for the redirect chain and automatic retries, not a fresh
+// timeout for every hop.
 //
 // If the client has ReadTimeout or WriteTimeout set, the shorter timeout applies.
 //

@@ -1140,6 +1140,22 @@ type clientDoer interface {
 	Do(req *Request, resp *Response) error
 }
 
+// deadlineClient gives every redirect hop and its retries the remaining share
+// of one absolute deadline instead of restarting the caller's timeout.
+type deadlineClient struct {
+	client   clientDoer
+	deadline time.Time
+}
+
+func (c *deadlineClient) Do(req *Request, resp *Response) error {
+	req.deadline = c.deadline
+	req.timeout = time.Until(c.deadline)
+	if req.timeout <= 0 {
+		return ErrTimeout
+	}
+	return c.client.Do(req, resp)
+}
+
 func clientGetURL(dst []byte, url string, c clientDoer) (statusCode int, body []byte, err error) {
 	req := AcquireRequest()
 
@@ -1187,7 +1203,8 @@ func clientGetURLDeadline(dst []byte, url string, deadline time.Time, c clientDo
 	go func() {
 		req := AcquireRequest()
 
-		statusCodeCopy, bodyCopy, errCopy := doRequestFollowRedirectsBuffer(req, nil, url, c)
+		dc := &deadlineClient{client: c, deadline: deadline}
+		statusCodeCopy, bodyCopy, errCopy := doRequestFollowRedirectsBuffer(req, nil, url, dc)
 		mu.Lock()
 		if !timedout {
 			bodyCopy = append(dst[:0], bodyCopy...)
@@ -1260,6 +1277,13 @@ var (
 	// body is received for a request whose body is a stream. The hop that produced the
 	// redirect consumed the stream, so the body cannot be sent again.
 	ErrRedirectBodyStream = errors.New("fasthttp: cannot follow a body-preserving redirect for a request with a body stream")
+	// ErrRequestBodyNotReplayable is returned when an automatic retry would have
+	// to send a body that can only be consumed once.
+	ErrRequestBodyNotReplayable = errors.New("fasthttp: request body is not replayable")
+	// ErrBodyNotReplayable is an alias for ErrRequestBodyNotReplayable.
+	ErrBodyNotReplayable = ErrRequestBodyNotReplayable
+	// ErrBodyStreamNotReplayable is an alias for ErrRequestBodyNotReplayable.
+	ErrBodyStreamNotReplayable = ErrRequestBodyNotReplayable
 
 	// ErrHostClientRedirectToDifferentScheme is returned when a HostClient follows a redirect to a different protocol.
 	ErrHostClientRedirectToDifferentScheme = errors.New("fasthttp: hostclient can't follow redirects to a different protocol," +
@@ -1283,6 +1307,26 @@ func closeOrDrainResponseBody(resp *Response, maxDrainSize int) error {
 		return resp.CloseBodyStream()
 	}
 	return resp.BodyWriteTo(io.Discard)
+}
+
+func closeResponseBodyForRetry(resp *Response) {
+	if resp != nil {
+		_ = resp.CloseBodyStream()
+	}
+}
+
+// wrapAttemptError keeps the lifecycle sentinel matchable while preserving
+// the last transport error and any response status produced by the attempt.
+func wrapAttemptError(sentinel, last error, resp *Response) error {
+	if last == nil {
+		return sentinel
+	}
+	if resp != nil {
+		if statusCode := resp.StatusCode(); statusCode > 0 {
+			return fmt.Errorf("%w after response status %d: %w", sentinel, statusCode, last)
+		}
+	}
+	return errors.Join(sentinel, last)
 }
 
 func responseBodyDrainSize(maxBodySize int) int {
@@ -1323,15 +1367,44 @@ func doRequestFollowRedirects(
 		defer ReleaseResponse(resp)
 	}
 
+	originalTimeout := req.timeout
+	originalDeadline := req.deadline
+	if originalTimeout < 0 {
+		return 0, nil, ErrTimeout
+	}
+	chainDeadline := originalDeadline
+	if originalTimeout > 0 {
+		timeoutDeadline := time.Now().Add(originalTimeout)
+		if chainDeadline.IsZero() || timeoutDeadline.Before(chainDeadline) {
+			chainDeadline = timeoutDeadline
+		}
+	}
+	if !chainDeadline.IsZero() {
+		req.deadline = chainDeadline
+		c = &deadlineClient{client: c, deadline: chainDeadline}
+		defer func() {
+			req.timeout = originalTimeout
+			req.deadline = originalDeadline
+		}()
+	}
+
 	redirectsCount := 0
 	initialHost := hostnameFromURLString(url)
+	// Preserve the caller's cookie header so policy can be evaluated afresh for
+	// every target domain. Collect first so repeated raw Cookie fields are all
+	// included in the saved, serialized value.
+	req.Header.collectCookies()
+	originalCookieHeader := bytes.Clone(req.Header.Peek(HeaderCookie))
+	// A cross-domain hop clears the header; returning to a trusted domain
+	// restores it instead of leaving the request permanently cookieless.
+	cookiesWereStripped := false
 	// Writing the request consumes a body stream, so remember it here: by the
 	// time a redirect arrives req.IsBodyStream() is already false.
 	hasBodyStream := req.IsBodyStream()
 
 	for {
-		if err := req.parseURI(); err != nil {
-			return 0, nil, err
+		if err = req.parseURI(); err != nil {
+			break
 		}
 
 		// Write builds Authorization from the userinfo when the request
@@ -1344,7 +1417,8 @@ func doRequestFollowRedirects(
 		}
 		statusCode = resp.Header.StatusCode()
 		if !StatusCodeIsRedirect(statusCode) {
-			break
+			// The caller owns the final response body, including its stream.
+			return statusCode, body, nil
 		}
 
 		redirectsCount++
@@ -1361,7 +1435,7 @@ func doRequestFollowRedirects(
 			// There is nothing to fetch for mailto:, tel: or an app callback
 			// such as com.example.app:/cb, so return the redirect response
 			// as is and leave the location to the caller.
-			break
+			return statusCode, body, nil
 		}
 		redirectURI := AcquireURI()
 		url, err = getRedirectURL(url, location, req.DisableRedirectPathNormalizing, redirectURI)
@@ -1371,7 +1445,15 @@ func doRequestFollowRedirects(
 			ReleaseURI(redirectURI)
 			break
 		}
-		stripSensitiveHeadersOnRedirect(req, initialHost, redirectURI)
+		if stripSensitiveHeadersOnRedirect(req, initialHost, redirectURI) {
+			cookiesWereStripped = true
+		} else if cookiesWereStripped && len(originalCookieHeader) > 0 {
+			// The current target is trusted relative to the initial host. The
+			// request is still empty from the untrusted hop, so reparsing the
+			// saved header cannot append duplicates.
+			req.Header.Set(HeaderCookie, b2s(originalCookieHeader))
+			cookiesWereStripped = false
+		}
 		if authFromUserinfo {
 			req.Header.del(strAuthorization)
 		}
@@ -1420,6 +1502,11 @@ func doRequestFollowRedirects(
 		ReleaseURI(redirectURI)
 	}
 
+	// A failed redirect chain never reaches the caller's final response. Close
+	// any stream its last response still owns so the connection cannot leak.
+	if err != nil {
+		_ = resp.CloseBodyStream()
+	}
 	return statusCode, body, err
 }
 
@@ -1453,15 +1540,16 @@ func getRedirectURL(baseURL string, location []byte, disablePathNormalizing bool
 // Redirect handling reuses the original Request, so sensitive request
 // headers must be cleared before following redirects that net/http treats
 // as untrusted.
-func stripSensitiveHeadersOnRedirect(req *Request, initialHost []byte, redirectURI *URI) {
+func stripSensitiveHeadersOnRedirect(req *Request, initialHost []byte, redirectURI *URI) bool {
 	if !shouldStripSensitiveHeadersOnRedirect(initialHost, redirectURI.Host()) {
-		return
+		return false
 	}
 
 	h := &req.Header
 	h.cookies = h.cookies[:0]
 	h.h = stripSensitiveFields(h.h)
 	h.trailerH = stripSensitiveFields(h.trailerH)
+	return true
 }
 
 func stripSensitiveFields(fields []argsKV) []argsKV {
@@ -1715,14 +1803,21 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 	attempts := 0
 	hasBodyStream := req.IsBodyStream()
 
-	// If a request has a timeout we store the timeout
-	// and calculate a deadline so we can keep updating the
-	// timeout on each retry.
-	deadline := time.Time{}
+	// If a request has a timeout we store the timeout and calculate a deadline
+	// so we can keep updating the timeout on each retry. A deadline installed
+	// by redirect handling is an absolute upper bound for the whole chain.
 	timeout := req.timeout
+	absoluteDeadline := req.deadline
+	deadline := absoluteDeadline
 	if timeout > 0 {
-		deadline = time.Now().Add(timeout)
+		requestDeadline := time.Now().Add(timeout)
+		if deadline.IsZero() || requestDeadline.Before(deadline) {
+			deadline = requestDeadline
+		}
+	} else if timeout < 0 && deadline.IsZero() {
+		deadline = time.Now()
 	}
+	var lastErr error
 	retryFunc := c.RetryIf
 	if retryFunc == nil {
 		retryFunc = isIdempotent
@@ -1730,22 +1825,41 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 
 	atomic.AddInt32(&c.pendingRequests, 1)
 	for {
-		// If the original timeout was set, we need to update
-		// the one set on the request to reflect the remaining time.
-		if timeout > 0 {
+		// Update the request timeout to the remaining shared budget. Do not
+		// start another attempt once it has expired or been canceled.
+		if !deadline.IsZero() {
 			req.timeout = time.Until(deadline)
 			if req.timeout <= 0 {
-				err = ErrTimeout
+				switch {
+				case lastErr == nil:
+					err = ErrTimeout
+				case errors.Is(lastErr, ErrTimeout):
+					err = ErrTimeout
+				default:
+					// Preserve the last transport/state error while also making
+					// the deadline failure matchable as ErrTimeout.
+					err = wrapAttemptError(ErrTimeout, lastErr, resp)
+				}
 				break
 			}
 		}
 
 		retry, err = c.do(req, resp)
+		if err == io.EOF {
+			err = ErrConnectionClosed
+		}
+		if err != nil {
+			lastErr = err
+		}
 		if err == nil || !retry {
 			break
 		}
 
 		if hasBodyStream {
+			// The first attempt consumed the only copy of this stream. Do not
+			// silently send an empty or partially consumed body again.
+			closeResponseBodyForRetry(resp)
+			err = wrapAttemptError(ErrRequestBodyNotReplayable, err, resp)
 			break
 		}
 		// Path prioritization based on ease of computation
@@ -1769,18 +1883,24 @@ func (c *HostClient) Do(req *Request, resp *Response) error {
 		if !retry {
 			break
 		}
+
+		// Close the failed attempt's body before sending the next one. The
+		// retry callback has already had its chance to inspect the response.
+		closeResponseBodyForRetry(resp)
+
 		if timeout > 0 && resetTimeout {
 			deadline = time.Now().Add(timeout)
+			if !absoluteDeadline.IsZero() && absoluteDeadline.Before(deadline) {
+				deadline = absoluteDeadline
+			}
 		}
 	}
 	atomic.AddInt32(&c.pendingRequests, -1)
 
-	// Restore the original timeout.
+	// Restore the timeout value this Do call entered with. req.deadline is
+	// owned by an enclosing redirect deadlineClient and must remain in place.
 	req.timeout = timeout
 
-	if err == io.EOF {
-		err = ErrConnectionClosed
-	}
 	return err
 }
 
