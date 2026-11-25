@@ -697,6 +697,12 @@ type RequestCtx struct {
 	handlerDeadlineSet      atomic.Bool
 	handlerReadDeadlineSet  bool
 	handlerWriteDeadlineSet atomic.Bool
+
+	// response is the single terminal-state tracker for the response served
+	// on this connection. Buffered writes, streamed flushes and hijack all
+	// transition it, so the response can only be finalized once. It is reset
+	// per request by reset.
+	response responseState
 }
 
 // EarlyHints allows the server to hint to the browser what resources a page would need
@@ -827,9 +833,11 @@ func (ctx *RequestCtx) HijackSetNoResponse(noResponse bool) {
 	ctx.hijackNoResponse = noResponse
 }
 
-// Hijacked returns true after Hijack is called.
+// Hijacked returns true after Hijack is called. It also remains true once the
+// server has completed the terminal transition and handed the connection to
+// the HijackHandler.
 func (ctx *RequestCtx) Hijacked() bool {
-	return ctx.hijackHandler != nil
+	return ctx.hijackHandler != nil || ctx.response.Status() == responseStatusHijacked
 }
 
 // SetUserValue stores the given value (arbitrary object)
@@ -1039,6 +1047,7 @@ func (ctx *RequestCtx) reset() {
 
 	ctx.hijackHandler = nil
 	ctx.hijackNoResponse = false
+	ctx.response.reset()
 }
 
 type firstByteReader struct {
@@ -1739,13 +1748,23 @@ func (ctx *RequestCtx) NotFound() {
 }
 
 // Write writes p into response body.
+//
+// Once the response has reached a terminal connection failure or been
+// hijacked, Write returns the stored terminal error instead of buffering bytes
+// that can never be sent.
 func (ctx *RequestCtx) Write(p []byte) (int, error) {
+	if ok, err := ctx.response.canWrite(); !ok {
+		return 0, err
+	}
 	ctx.Response.AppendBody(p)
 	return len(p), nil
 }
 
 // WriteString appends s to response body.
 func (ctx *RequestCtx) WriteString(s string) (int, error) {
+	if ok, err := ctx.response.canWrite(); !ok {
+		return 0, err
+	}
 	ctx.Response.AppendBodyString(s)
 	return len(s), nil
 }
@@ -2584,6 +2603,18 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 	for {
 		connRequestNum++
 
+		// If Shutdown started in the gap after the previous response, enter the
+		// closing state before admitting another response. The first request on a
+		// connection is not marked here: Shutdown's ctx cancellation can race its
+		// admission and handlers such as TestShutdownErr are still allowed to
+		// produce that one already-submitted response. The loop's stop check
+		// below drains held-back output and exits. A response still streaming at
+		// this point is deliberately left alone so it can finish within the
+		// shutdown deadline.
+		if connRequestNum > 1 && s.stop.Load() == 1 {
+			ctx.response.beginClosing()
+		}
+
 		if connRequestNum == 1 {
 			// Apply ReadTimeout to the first request byte.
 			if s.ReadTimeout > 0 {
@@ -2699,6 +2730,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 					if err == ErrNeedMore {
 						err = bw.Flush()
 						if err != nil {
+							err = ctx.response.fail(err)
 							break
 						}
 
@@ -2836,10 +2868,12 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 				// Send 'HTTP/1.1 100 Continue' response.
 				_, err = bw.Write(strResponseContinue)
 				if err != nil {
+					err = ctx.response.fail(err)
 					break
 				}
 				err = bw.Flush()
 				if err != nil {
+					err = ctx.response.fail(err)
 					break
 				}
 				if s.ReduceMemoryUsage {
@@ -3045,7 +3079,15 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 				ctx.handlerWriteDeadlineSet.Load() || (s.ReduceMemoryUsage && hijackHandler == nil) {
 				err = bw.Flush()
 				if err != nil {
+					// The flush is the moment buffered response bytes actually
+					// reach the connection. Record it on the shared state machine
+					// so a concurrent producer observes the same terminal error
+					// instead of attempting another ending.
+					err = ctx.response.fail(err)
 					break
+				}
+				if hijackHandler == nil {
+					ctx.response.finish()
 				}
 			}
 
@@ -3067,26 +3109,38 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		}
 
 		if hijackHandler != nil {
-			var hjr io.Reader = c
+			hjr := io.Reader(c)
 			if br != nil {
 				hjr = br
-				br = nil
 			}
-			// The hijack handler may still read the request stream, so leave
-			// it to the GC instead of releasing it.
-			reqStream = nil
 			if bw != nil {
 				err = bw.Flush()
 				if err != nil {
+					err = ctx.response.fail(err)
 					break
 				}
 				releaseWriter(s, bw)
 				bw = nil
 			}
-			err = c.SetDeadline(zeroTime)
-			if err != nil {
+			if err = c.SetDeadline(zeroTime); err != nil {
+				err = ctx.response.fail(err)
 				break
 			}
+			// From this transition onward the handler owns the connection. It is
+			// terminal: the server must not flush an HTTP trailer, write another
+			// response or close it through the normal teardown. A response that
+			// already failed cannot be hijacked, so its broken connection is
+			// closed instead.
+			if err = ctx.response.hijack(); err != nil {
+				break
+			}
+
+			// Ownership has transferred. Only now detach the reader and request
+			// stream from the normal cleanup path; a failed transition above
+			// still releases them there. The hijack handler may keep reading the
+			// request stream, so it is left to the GC rather than released.
+			br = nil
+			reqStream = nil
 			go hijackConnHandler(ctx, hjr, c, s, hijackHandler)
 			err = errHijacked
 			break
@@ -3113,9 +3167,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			if ctx.handlerWriteDeadlineSet.Load() {
 				if bw != nil && bw.Buffered() > 0 {
 					if err = bw.Flush(); err != nil {
+						err = ctx.response.fail(err)
 						ctx.deadlineMu.Unlock()
 						break
 					}
+					ctx.response.finish()
 				}
 				if err = c.SetWriteDeadline(zeroTime); err != nil {
 					ctx.deadlineMu.Unlock()
@@ -3138,6 +3194,11 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 		ctx.Response.KeepBodyBuffer = false
 		ctx.Request.Reset()
 		ctx.Response.Reset()
+		// The response terminal state belongs to the request that just
+		// finished. A keep-alive connection starts the next response back in
+		// Init; if Shutdown started meanwhile, the loop top moves it straight
+		// to Closing before another response can begin.
+		ctx.response.reset()
 		ctx.remoteAddr = nil
 		if ctx.s != nil {
 			keepBodyBuffer := !ctx.s.ReduceMemoryUsage
@@ -3151,9 +3212,20 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			// response held back for it.
 			if bw != nil && bw.Buffered() > 0 {
 				err = bw.Flush()
+				if err != nil {
+					err = ctx.response.fail(err)
+				} else {
+					ctx.response.finish()
+				}
 			}
 			break
 		}
+	}
+
+	// A graceful shutdown that won the race before a new response started is
+	// not a serving failure. Active streams never return errResponseClosing.
+	if errors.Is(err, errResponseClosing) {
+		err = nil
 	}
 
 	if br != nil {
@@ -3294,9 +3366,13 @@ func writeResponse(ctx *RequestCtx, w *bufio.Writer) error {
 	if ctx.timeoutResponse != nil {
 		return errors.New("cannot write timed out response")
 	}
-	err := ctx.Response.write(ctx.c, w)
-
-	return err
+	if err := ctx.response.beginResponse(); err != nil {
+		// The response serializer did not run, so a body-stream writer goroutine
+		// registered by the handler would otherwise wait forever on its pipe.
+		_ = ctx.Response.closeBodyStream(err)
+		return err
+	}
+	return ctx.Response.write(ctx.c, w, &ctx.response)
 }
 
 const (
@@ -3607,6 +3683,13 @@ func defaultErrorHandler(ctx *RequestCtx, err error) {
 }
 
 func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverName string, err error) *bufio.Writer {
+	// A response that has already reached a terminal state (streamed bytes that
+	// hit a disconnect, or a hijacked connection) cannot carry an error
+	// response: there is no valid place to write it, so just tear down.
+	if ctx.response.isTerminal() {
+		return bw
+	}
+
 	errorHandler := defaultErrorHandler
 	if s.ErrorHandler != nil {
 		errorHandler = s.ErrorHandler
@@ -3622,9 +3705,12 @@ func (s *Server) writeErrorResponse(bw *bufio.Writer, ctx *RequestCtx, serverNam
 		bw = acquireWriter(ctx)
 	}
 
-	writeResponse(ctx, bw) //nolint:errcheck
+	if werr := writeResponse(ctx, bw); werr != nil {
+		ctx.response.fail(werr)
+	} else if ferr := bw.Flush(); ferr != nil {
+		ctx.response.fail(ferr)
+	}
 	ctx.Response.Reset()
-	bw.Flush()
 
 	return bw
 }

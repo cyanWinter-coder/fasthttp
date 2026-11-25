@@ -2706,13 +2706,19 @@ type flushWriter struct {
 func (w *flushWriter) Write(p []byte) (int, error) {
 	n, err := w.wf.Write(p)
 	if err != nil {
-		return 0, err
+		// Keep a valid partial count so callers record the real progress. A
+		// count outside [0, len(p)] is not progress (some rejecting writers
+		// return a stale internal count), so normalize only that case.
+		if n < 0 || n > len(p) {
+			n = 0
+		}
+		return n, err
 	}
 	if err = w.wf.Flush(); err != nil {
-		return 0, err
+		return n, err
 	}
 	if err = w.bw.Flush(); err != nil {
-		return 0, err
+		return n, err
 	}
 	return n, nil
 }
@@ -2727,16 +2733,22 @@ func (w *flushWriter) WriteString(s string) (int, error) {
 //
 // See also WriteTo.
 func (resp *Response) Write(w *bufio.Writer) error {
-	return resp.write(nil, w)
+	return resp.write(nil, w, nil)
 }
 
 // write serializes the response into w. conn must be the connection w buffers
-// for, or nil.
-func (resp *Response) write(conn net.Conn, w *bufio.Writer) error {
+// for, or nil. An optional state is the per-connection response lifecycle
+// tracker that records the streaming transition, partial-write progress and
+// the first terminal error so the response is finalized exactly once.
+func (resp *Response) write(conn net.Conn, w *bufio.Writer, states ...*responseState) error {
+	var state *responseState
+	if len(states) > 0 {
+		state = states[0]
+	}
 	sendBody := !resp.mustSkipBody()
 
 	if resp.bodyStream != nil {
-		return resp.writeBodyStream(w, sendBody)
+		return resp.writeBodyStream(w, sendBody, state)
 	}
 
 	body := resp.bodyBytes()
@@ -2747,30 +2759,67 @@ func (resp *Response) write(conn net.Conn, w *bufio.Writer) error {
 	if sendBody && len(resp.Header.trailer) > 0 && resp.Header.IsHTTP11() {
 		resp.Header.SetContentLength(-1)
 		if err := resp.Header.Write(w); err != nil {
-			return err
+			return resp.failWrite(state, err, 0)
 		}
 		if err := writeBufferedBodyChunked(w, body); err != nil {
-			return err
+			return resp.failWrite(state, err, 0)
 		}
-		return resp.Header.writeTrailer(w)
+		if err := resp.Header.writeTrailer(w); err != nil {
+			return resp.failWrite(state, err, 0)
+		}
+		if state != nil {
+			state.recordProgress(int64(bodyLen))
+			state.complete()
+		}
+		return nil
 	}
 	header := resp.Header.serialize(w)
 	// A response the buffer cannot hold at all costs a partial copy and a
 	// second write; writev sends both pieces from where they already are.
 	if sendBody && bodyLen > 0 && len(header)+bodyLen > w.Size() {
 		if vw := vectorWriter(conn); vw != nil {
-			return resp.writeVectored(vw, w, header, body)
+			err := resp.writeVectored(vw, w, header, body)
+			if err != nil {
+				return resp.failWrite(state, err, 0)
+			}
+			if state != nil {
+				state.recordProgress(int64(bodyLen))
+				state.complete()
+			}
+			return nil
 		}
 	}
 	if _, err := w.Write(header); err != nil {
-		return err
+		return resp.failWrite(state, err, 0)
 	}
 	if sendBody {
-		if _, err := w.Write(body); err != nil {
-			return err
+		n, err := w.Write(body)
+		if err != nil {
+			// Record the bytes that did land in the writer before the failure,
+			// so a partial write keeps its real progress and every later write
+			// returns this same connection error.
+			return resp.failWrite(state, err, int64(n))
+		}
+		if state != nil {
+			state.recordProgress(int64(n))
 		}
 	}
+	if state != nil {
+		state.complete()
+	}
 	return nil
+}
+
+// failWrite funnels every write failure through the lifecycle tracker. A nil
+// state (client-side or standalone Response use) keeps the original error.
+func (resp *Response) failWrite(state *responseState, err error, progress int64) error {
+	if state == nil {
+		return err
+	}
+	if progress > 0 {
+		state.recordProgress(progress)
+	}
+	return state.fail(err)
 }
 
 // writeVectored sends the header and body to vw as one writev. w buffers for
@@ -2841,8 +2890,8 @@ func (req *Request) writeBodyStream(w *bufio.Writer) error {
 	req.Header.written = true
 	if err = req.Header.Write(w); err == nil {
 		if contentLength >= 0 {
-			err = writeBodyFixedSize(w, req.bodyStream, int64(contentLength), &req.bodyStreamWriter)
-		} else if err = writeBodyChunked(w, req.bodyStream); err == nil {
+			err = writeBodyFixedSize(w, req.bodyStream, int64(contentLength), &req.bodyStreamWriter, nil)
+		} else if err = writeBodyChunked(w, req.bodyStream, nil); err == nil {
 			err = req.Header.writeTrailer(w)
 		}
 	}
@@ -2859,7 +2908,11 @@ type ErrBodyStreamWritePanic struct {
 	error
 }
 
-func (resp *Response) writeBodyStream(w *bufio.Writer, sendBody bool) (err error) {
+func (resp *Response) writeBodyStream(w *bufio.Writer, sendBody bool, states ...*responseState) (err error) {
+	var state *responseState
+	if len(states) > 0 {
+		state = states[0]
+	}
 	resp.Header.written = true
 	defer func() {
 		resp.Header.written = false
@@ -2867,8 +2920,22 @@ func (resp *Response) writeBodyStream(w *bufio.Writer, sendBody bool) (err error
 			err = &ErrBodyStreamWritePanic{
 				error: fmt.Errorf("panic while writing body stream: %+v", r),
 			}
+			if state != nil {
+				err = state.fail(err)
+			}
 		}
 	}()
+
+	if state != nil {
+		// The headers are about to be committed: from here on this is a
+		// streaming response, and any failure must end it rather than letting
+		// another path append a second HTTP ending.
+		state.beginStreaming()
+		if ok, stateErr := state.canWrite(); !ok {
+			_ = resp.closeBodyStream(stateErr)
+			return stateErr
+		}
+	}
 
 	contentLength := resp.Header.ContentLength()
 	if contentLength < 0 {
@@ -2889,7 +2956,7 @@ func (resp *Response) writeBodyStream(w *bufio.Writer, sendBody bool) (err error
 				err = w.Flush()
 			}
 			if err == nil && sendBody {
-				err = writeBodyFixedSize(w, resp.bodyStream, int64(contentLength), &resp.bodyStreamWriter)
+				err = writeBodyFixedSize(w, resp.bodyStream, int64(contentLength), &resp.bodyStreamWriter, state)
 			}
 		}
 	} else {
@@ -2900,15 +2967,25 @@ func (resp *Response) writeBodyStream(w *bufio.Writer, sendBody bool) (err error
 			}
 			// Trailers frame the body, so a response without one has none.
 			if err == nil && sendBody {
-				if err = writeBodyChunked(w, resp.bodyStream); err == nil {
+				if err = writeBodyChunked(w, resp.bodyStream, state); err == nil {
 					err = resp.Header.writeTrailer(w)
 				}
 			}
 		}
 	}
+	if err != nil {
+		if state != nil {
+			err = state.fail(err)
+		}
+	} else if state != nil {
+		state.complete()
+	}
 	errc := resp.closeBodyStream(err)
 	if err == nil {
 		err = errc
+		if state != nil && err != nil {
+			err = state.fail(err)
+		}
 	}
 	return err
 }
@@ -3091,8 +3168,14 @@ func (cw *chunkedBodyWriter) Write(p []byte) (int, error) {
 }
 
 // writeBodyChunked flushes each chunk; the last one stays buffered for the
-// trailer section that completes the body.
-func writeBodyChunked(w *bufio.Writer, r io.Reader) error {
+// trailer section that completes the body. An optional state records body
+// progress and lets a connection failure recorded on another goroutine stop
+// the copy loop instead of writing further chunks onto a dead connection.
+func writeBodyChunked(w *bufio.Writer, r io.Reader, states ...*responseState) error {
+	var state *responseState
+	if len(states) > 0 {
+		state = states[0]
+	}
 	// Frame WriteTo output directly, skipping copyBufPool, for bodies whose
 	// WriteTo is known to match reading.
 	var wt io.WriterTo
@@ -3123,11 +3206,20 @@ func writeBodyChunked(w *bufio.Writer, r io.Reader) error {
 	var err error
 	var n int
 	for {
+		if state != nil {
+			if ok, stateErr := state.canWrite(); !ok {
+				err = stateErr
+				break
+			}
+		}
 		n, err = r.Read(buf)
 		if n > 0 {
 			if writeErr := writeChunk(w, buf[:n]); writeErr != nil {
 				err = writeErr
 				break
+			}
+			if state != nil {
+				state.recordProgress(int64(n))
 			}
 		}
 		if err != nil {
@@ -3150,7 +3242,13 @@ func limitedReaderSize(r io.Reader) int64 {
 	return lr.N
 }
 
-func writeBodyFixedSize(w *bufio.Writer, r io.Reader, size int64, bodyWriter **fixedSizeBodyWriter) error {
+func writeBodyFixedSize(w *bufio.Writer, r io.Reader, size int64, bodyWriter **fixedSizeBodyWriter,
+	states ...*responseState,
+) error {
+	var state *responseState
+	if len(states) > 0 {
+		state = states[0]
+	}
 	// Keep using a stream's WriterTo when available, but never let it write
 	// past the advertised size onto a persistent connection.
 	// Reuse the request or response's state to avoid allocating a writer.
@@ -3158,11 +3256,14 @@ func writeBodyFixedSize(w *bufio.Writer, r io.Reader, size int64, bodyWriter **f
 		*bodyWriter = &fixedSizeBodyWriter{}
 	}
 	bw := *bodyWriter
-	*bw = fixedSizeBodyWriter{w: w, remaining: size}
+	*bw = fixedSizeBodyWriter{w: w, remaining: size, state: state}
 	defer func() {
 		*bw = fixedSizeBodyWriter{}
 	}()
 	n, err := copyBodyStream(bw, r)
+	if state != nil {
+		state.recordProgress(n)
+	}
 	if bw.overrun && err == nil {
 		err = errBodyStreamTooLong
 	}
@@ -3181,9 +3282,17 @@ type fixedSizeBodyWriter struct {
 	remaining     int64
 	overrunBuf    [1]byte
 	overrun       bool
+	// state, when set, is the response lifecycle tracker. A disconnect
+	// recorded concurrently turns every later write into the same stored
+	// error, stopping the copy before another byte reaches the dead
+	// connection.
+	state *responseState
 }
 
 func (w *fixedSizeBodyWriter) ReadFrom(r io.Reader) (int64, error) {
+	if ok, err := w.checkState(); !ok {
+		return 0, err
+	}
 	stream := r
 	var limited *io.LimitedReader
 	if lr, ok := r.(*io.LimitedReader); ok {
@@ -3234,6 +3343,9 @@ func (w *fixedSizeBodyWriter) ReadFrom(r io.Reader) (int64, error) {
 }
 
 func (w *fixedSizeBodyWriter) Write(p []byte) (int, error) {
+	if ok, err := w.checkState(); !ok {
+		return 0, err
+	}
 	if int64(len(p)) > w.remaining {
 		w.overrun = true
 		p = p[:int(w.remaining)]
@@ -3252,6 +3364,16 @@ func (w *fixedSizeBodyWriter) Write(p []byte) (int, error) {
 		err = errBodyStreamTooLong
 	}
 	return n, err
+}
+
+// checkState returns false with the stored terminal error once the response
+// has failed, been hijacked or is closing. A nil state means the writer serves
+// a request or standalone response without lifecycle tracking.
+func (w *fixedSizeBodyWriter) checkState() (bool, error) {
+	if w.state == nil {
+		return true, nil
+	}
+	return w.state.canWrite()
 }
 
 func (w *fixedSizeBodyWriter) WriteString(s string) (int, error) {
