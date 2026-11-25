@@ -7650,6 +7650,7 @@ func TestShutdownWithContext(t *testing.T) {
 			<-done
 			ctx.Success("aaa/bbb", []byte("real response"))
 		},
+		Logger: &testLogger{},
 	}
 	go func() {
 		if err := s.Serve(ln); err != nil {
@@ -7657,36 +7658,32 @@ func TestShutdownWithContext(t *testing.T) {
 		}
 	}()
 
-	clientErr := make(chan error, 1)
+	clientEnded := make(chan error, 1)
 	go func() {
 		conn, err := ln.Dial()
 		if err != nil {
-			clientErr <- fmt.Errorf("unexpected error: %w", err)
+			clientEnded <- fmt.Errorf("unexpected error: %w", err)
 			return
 		}
 
 		if _, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: google.com\r\n\r\n")); err != nil {
-			clientErr <- fmt.Errorf("unexpected error: %w", err)
+			clientEnded <- fmt.Errorf("unexpected error: %w", err)
 			return
 		}
-		br := bufio.NewReader(conn)
-		verifyResponse(t, br, StatusOK, "aaa/bbb", "real response")
-		clientErr <- nil
+		_, err = io.Copy(io.Discard, conn)
+		clientEnded <- err
 	}()
 
 	select {
 	case <-handlerStarted:
-	case err := <-clientErr:
-		if err != nil {
-			t.Fatal(err)
-		}
-		t.Fatal("client finished before handler started")
+	case err := <-clientEnded:
+		t.Fatalf("client ended before handler started: %v", err)
 	case <-time.After(testTimeout(time.Second)):
 		t.Fatal("handler didn't start")
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 500*time.Millisecond)
 	defer cancel()
-	shutdownErr := make(chan error)
+	shutdownErr := make(chan error, 1)
 	go func() {
 		shutdownErr <- s.ShutdownWithContext(ctx)
 	}()
@@ -7694,23 +7691,37 @@ func TestShutdownWithContext(t *testing.T) {
 	timer := time.NewTimer(time.Second)
 	select {
 	case <-timer.C:
-		t.Fatal("idle connections not closed on shutdown")
+		t.Fatal("bounded shutdown did not return at its deadline")
 	case err := <-shutdownErr:
-		if err == nil || err != context.DeadlineExceeded {
+		if !errors.Is(err, context.DeadlineExceeded) {
 			t.Fatalf("unexpected err %v. Expecting %v", err, context.DeadlineExceeded)
 		}
 	}
+
+	// The deadline closes the remaining connection, so the waiting client's
+	// read side reaches EOF or a closed-connection error.
+	select {
+	case <-clientEnded:
+	case <-time.After(testTimeout(time.Second)):
+		t.Fatal("deadline did not close the remaining client connection")
+	}
+
+	// Repeated calls in the same lifecycle share the terminal result.
+	if err := s.ShutdownWithContext(context.Background()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("second ShutdownWithContext() error = %v, want %v", err, context.DeadlineExceeded)
+	}
+
 	if o := s.open.Load(); o != 1 {
 		t.Fatalf("unexpected open connection num: %#v. Expecting %#v", o, 1)
 	}
 	closeDone.Do(func() { close(done) })
-	select {
-	case err := <-clientErr:
-		if err != nil {
-			t.Fatal(err)
-		}
-	case <-time.After(testTimeout(time.Second)):
-		t.Fatal("client didn't receive response")
+
+	deadline := time.Now().Add(testTimeout(time.Second))
+	for time.Now().Before(deadline) && s.open.Load() != 0 {
+		time.Sleep(time.Millisecond)
+	}
+	if o := s.open.Load(); o != 0 {
+		t.Fatalf("open connections = %d after releasing handler, want 0", o)
 	}
 }
 

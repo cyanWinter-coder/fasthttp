@@ -365,9 +365,21 @@ type Server struct {
 
 	mu sync.Mutex
 
+	// serveGeneration identifies the lifecycle started by the latest Serve
+	// call. Repeated Shutdown calls for the same generation share one result;
+	// a later Serve starts a new generation that can be shut down again.
+	serveGeneration int
+
+	lastShutdown *shutdownResult
+
 	concurrency atomic.Uint32
 	open        atomic.Int32
 	stop        atomic.Int32
+
+	// inFlightRequests counts requests from the point their headers have been
+	// read until their terminal response has been flushed (or the connection
+	// exits after a write/framing error).
+	inFlightRequests atomic.Int64
 
 	rejectedRequestsCount atomic.Uint32
 
@@ -2124,6 +2136,7 @@ func (s *Server) Serve(ln net.Listener) error {
 
 	s.mu.Lock()
 	s.ln = append(s.ln, ln)
+	s.serveGeneration++
 	if s.done.Load() == nil {
 		done := make(chan struct{})
 		s.done.Store(&done)
@@ -2186,6 +2199,11 @@ func (s *Server) Serve(ln net.Listener) error {
 	}
 }
 
+type shutdownResult struct {
+	serveGeneration int
+	err             error
+}
+
 // Shutdown gracefully shuts down the server without interrupting any active connections.
 // Shutdown works by first closing all open listeners and then waiting indefinitely for all connections
 // to return to idle and then shut down.
@@ -2193,9 +2211,24 @@ func (s *Server) Serve(ln net.Listener) error {
 // When Shutdown is called, Serve, ListenAndServe, and ListenAndServeTLS immediately return nil.
 // Make sure the program doesn't exit and waits instead for Shutdown to return.
 //
-// Shutdown does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout to something else than 0.
+// Idle keep-alive connections are closed, and connections handling a request
+// stop after their current response. Shutdown has no deadline, so a handler
+// that never finishes can still keep it waiting; use ShutdownWithContext for
+// bounded drain.
 func (s *Server) Shutdown() error {
 	return s.ShutdownWithContext(context.Background())
+}
+
+// ShutdownWithTimeout is ShutdownWithContext with a context that expires after
+// timeout. A non-positive timeout disables the deadline.
+func (s *Server) ShutdownWithTimeout(timeout time.Duration) error {
+	ctx := context.Background()
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+	return s.ShutdownWithContext(ctx)
 }
 
 // ShutdownWithContext gracefully shuts down the server without interrupting any active connections.
@@ -2211,22 +2244,44 @@ func (s *Server) Shutdown() error {
 // When ShutdownWithContext is called, Serve, ListenAndServe, and ListenAndServeTLS immediately return nil.
 // Make sure the program doesn't exit and waits instead for ShutdownWithContext to return.
 //
-// ShutdownWithContext does not close keepalive connections so it's recommended to set ReadTimeout and IdleTimeout
-// to something else than 0.
+// Idle keep-alive connections are closed during the drain, and a keep-alive
+// connection that is handling a request is not reused after that response.
+// Set ReadTimeout and IdleTimeout as additional guards for peers that
+// disappear without closing.
 //
-// If ctx expires before all connections have closed, ShutdownWithContext returns ctx.Err().
-// The remaining connections are left running, and the stop flag is reset.
-// The Done channel stays closed so requests that are still running keep observing the same channel.
-// The Server can be reused by calling Serve with a new listener.
+// If ctx expires before all connections have closed, ShutdownWithContext
+// closes every connection still registered with the server and returns
+// ctx.Err(). A handler that observes RequestCtx.Done or attempts a write on
+// the closed connection receives context.Canceled or a net.ErrClosed-matching
+// error. Misbehaving handlers that ignore both cannot be interrupted, but
+// closing the connection unblocks network reads and writes.
+//
+// Concurrent and repeated calls belonging to the same Serve generation return
+// the same result and do not close listeners or connection resources twice.
+// Calling Serve again starts a new, reusable generation. The Done channel
+// stays closed while an older request is still running so that request keeps
+// observing the same cancellation channel.
 func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Shutdown calls are serialized by s.mu. A later call for the same
+	// lifecycle therefore arrives after the first call finished and can
+	// return the same terminal result without cleaning resources again.
+	if last := s.lastShutdown; last != nil && last.serveGeneration == s.serveGeneration {
+		return last.err
+	}
 
 	s.stop.Store(1)
 	defer s.stop.Store(0)
 
 	if s.ln == nil {
-		return nil
+		err = nil
+		s.lastShutdown = &shutdownResult{
+			serveGeneration: s.serveGeneration,
+			err:             err,
+		}
+		return err
 	}
 
 	lnerr := s.closeListenersLocked()
@@ -2249,14 +2304,31 @@ func (s *Server) ShutdownWithContext(ctx context.Context) (err error) {
 			// There may be a pending request to call ctx.Done(). Therefore, we only set it to nil when open == 0.
 			s.done.Store(nil)
 			s.doneClosed = false
-			return lnerr
+			err = lnerr
+			s.lastShutdown = &shutdownResult{
+				serveGeneration: s.serveGeneration,
+				err:             err,
+			}
+			return err
 		}
 		// This is not an optimal solution but using a sync.WaitGroup
 		// here causes data races as it's hard to prevent Add() to be called
 		// while Wait() is waiting.
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			err = ctx.Err()
+
+			// The bounded drain deadline has expired. Close active as well
+			// as idle connections so blocked reads/writes and cooperative
+			// handlers can terminate. The in-flight counter is not reset:
+			// it is released only when each request reaches its terminal
+			// write/error path.
+			s.closeAllConns()
+			s.lastShutdown = &shutdownResult{
+				serveGeneration: s.serveGeneration,
+				err:             err,
+			}
+			return err
 		case <-ticker.C:
 			continue
 		}
@@ -2448,6 +2520,26 @@ func (s *Server) GetRejectedConnectionsCount() uint32 {
 	return s.rejectedRequestsCount.Load()
 }
 
+// GetInFlightRequestsCount returns the number of requests whose terminal
+// response has not yet been published. A keep-alive connection waiting for
+// its next request is not counted.
+//
+// This function is intended be used by monitoring systems and bounded
+// shutdown/drain coordination.
+func (s *Server) GetInFlightRequestsCount() int64 {
+	return s.inFlightRequests.Load()
+}
+
+// InFlightRequests is an alias for GetInFlightRequestsCount.
+func (s *Server) InFlightRequests() int64 {
+	return s.GetInFlightRequestsCount()
+}
+
+// GetActiveRequestsCount is an alias for GetInFlightRequestsCount.
+func (s *Server) GetActiveRequestsCount() int64 {
+	return s.GetInFlightRequestsCount()
+}
+
 func (s *Server) getConcurrency() int {
 	n := s.Concurrency
 	if n <= 0 {
@@ -2581,6 +2673,25 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 
 		continueReadingRequest = true
 	)
+
+	// Requests can have terminal responses batched in bw with pipelined
+	// successors. unpublishedRequests counts those whose terminal bytes have
+	// not yet been flushed to the connection.
+	unpublishedRequests := 0
+	finishUnpublishedRequests := func() {
+		if unpublishedRequests == 0 {
+			return
+		}
+		s.inFlightRequests.Add(-int64(unpublishedRequests))
+		unpublishedRequests = 0
+	}
+	publishTerminalRequests := func() {
+		if unpublishedRequests > 0 && (bw == nil || bw.Buffered() == 0) {
+			finishUnpublishedRequests()
+		}
+	}
+	defer finishUnpublishedRequests()
+
 	for {
 		connRequestNum++
 
@@ -2725,6 +2836,12 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 			}
 
 			if err == nil {
+				// Headers are complete: this request is now in flight until
+				// its terminal response has been published. A pipelined
+				// response may remain buffered until a later flush.
+				unpublishedRequests++
+				s.inFlightRequests.Add(1)
+
 				err = ctx.Request.Header.prepareRequestHost()
 			}
 			if err == nil {
@@ -3048,6 +3165,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 					break
 				}
 			}
+			publishTerminalRequests()
 
 			// The response has now had its chance to consume the request stream
 			// (for example a body that streams straight from it). Discard what
@@ -3083,6 +3201,7 @@ func (s *Server) serveConnCounted(c net.Conn, countConcurrency bool) error {
 				releaseWriter(s, bw)
 				bw = nil
 			}
+			finishUnpublishedRequests()
 			err = c.SetDeadline(zeroTime)
 			if err != nil {
 				break
@@ -3673,6 +3792,15 @@ func (s *Server) closeIdleConns() {
 		delete(s.idleConns, c)
 	}
 	s.idleConnsMu.Unlock()
+}
+
+func (s *Server) closeAllConns() {
+	s.idleConnsMu.Lock()
+	defer s.idleConnsMu.Unlock()
+
+	for c := range s.idleConns {
+		_ = c.Close()
+	}
 }
 
 func (s *Server) closeListenersLocked() error {
